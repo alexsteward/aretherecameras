@@ -23,17 +23,31 @@ class NetworkDeviceScanner:
         self.common_ports = [80, 8080, 443, 8443, 81, 8081, 8888, 9000]
         
     def ping_host(self, ip):
-        """Check if host is alive using ping"""
+        """Check if host is alive using socket connection"""
         try:
+            # Try socket connection first (faster and more reliable)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((str(ip), 80))
+            sock.close()
+            if result == 0:
+                return True
+                
+            # Try HTTPS port
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((str(ip), 443))
+            sock.close()
+            if result == 0:
+                return True
+                
+            # Try ping as backup
             param = "-n" if platform.system().lower() == "windows" else "-c"
-            timeout = "1000" if platform.system().lower() == "windows" else "1"
-            timeout_flag = "-W" if platform.system().lower() == "windows" else "-w"
-            
-            command = ["ping", param, "1", timeout_flag, timeout, str(ip)]
-            result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+            command = ["ping", param, "1", str(ip)]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
             return result.returncode == 0
         except:
-            return False
+            return True  # If ping fails, still try to connect
     
     def get_hostname(self, ip):
         """Try to get hostname"""
@@ -47,26 +61,25 @@ class NetworkDeviceScanner:
         """Check if there's a web interface on this IP:port"""
         protocols = ['http']
         if port in [443, 8443]:
-            protocols = ['https', 'http']
-        elif port in [80, 8080, 81, 8081, 8888, 9000]:
-            protocols = ['http', 'https']
-            
+            protocols = ['https']
+        
         for protocol in protocols:
             try:
                 url = f"{protocol}://{ip}:{port}"
-                response = requests.get(url, timeout=5, verify=False, 
-                                      headers={'User-Agent': 'Mozilla/5.0'})
+                response = requests.get(url, timeout=8, verify=False, 
+                                      headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+                                      allow_redirects=True)
                 
-                if response.status_code == 200:
+                if response.status_code in [200, 401, 403]:
                     return True, url, response.text, response.headers
-                elif response.status_code in [401, 403]:  # Auth required
-                    return True, url, "Authentication Required", response.headers
                     
-            except requests.exceptions.SSLError:
+            except requests.exceptions.Timeout:
                 continue
             except requests.exceptions.ConnectionError:
                 continue
-            except:
+            except requests.exceptions.RequestException:
+                continue
+            except Exception:
                 continue
                 
         return False, None, None, None
@@ -181,27 +194,26 @@ class NetworkDeviceScanner:
         """Scan a single IP address"""
         ip_str = str(ip)
         
-        # First check if host is alive
-        if not self.ping_host(ip_str):
-            return None
-            
-        # Try to find web interfaces
+        # Try to find web interfaces on common ports
         for port in self.common_ports:
             has_web, url, content, headers = self.check_web_interface(ip_str, port)
             if has_web:
                 device_info = self.identify_device(ip, url, content, headers)
                 return device_info
+        
+        # If no web interface found, check if host responds at all
+        if self.ping_host(ip_str):
+            return {
+                'ip': ip_str,
+                'url': 'No web interface',
+                'hostname': self.get_hostname(ip_str),
+                'device_type': '📱 Network Device',
+                'brand': 'Unknown',
+                'description': 'Device online but no web interface on common ports',
+                'status': 'Online'
+            }
                 
-        # If no web interface but responds to ping
-        return {
-            'ip': ip_str,
-            'url': 'No web interface',
-            'hostname': self.get_hostname(ip_str),
-            'device_type': '📱 Network Device',
-            'brand': 'Unknown',
-            'description': 'Responds to ping but no web interface found',
-            'status': 'Online'
-        }
+        return None
     
     def scan_network(self, network_range, progress_callback=None):
         """Scan entire network range"""
