@@ -170,21 +170,19 @@ def main():
     # Sidebar for configuration
     st.sidebar.header("⚙️ Configuration")
     
-    # Get available networks
-    available_networks = scanner.get_local_networks()
+    # Manual network input
+    selected_network = st.sidebar.text_input(
+        "Network Range (CIDR):",
+        value="192.168.0.0/16",
+        help="Enter network range in CIDR notation (e.g., 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12)"
+    )
     
-    if available_networks:
-        selected_network = st.sidebar.selectbox(
-            "Select Network Range:",
-            available_networks,
-            help="Choose the network range to scan"
-        )
-    else:
-        selected_network = st.sidebar.text_input(
-            "Network Range (CIDR):",
-            value="192.168.1.0/24",
-            help="Enter network range in CIDR notation (e.g., 192.168.1.0/24)"
-        )
+    # Show some common examples
+    st.sidebar.markdown("**Common ranges:**")
+    st.sidebar.markdown("• `192.168.0.0/16` - All 192.168.x.x")
+    st.sidebar.markdown("• `192.168.1.0/24` - 192.168.1.1-254")
+    st.sidebar.markdown("• `10.0.0.0/8` - All 10.x.x.x")
+    st.sidebar.markdown("• `172.16.0.0/12` - 172.16-31.x.x")
     
     scan_button = st.sidebar.button("🔍 Start Scan", type="primary")
     
