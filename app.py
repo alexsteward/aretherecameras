@@ -194,24 +194,38 @@ class NetworkDeviceScanner:
         """Scan a single IP address"""
         ip_str = str(ip)
         
-        # Try to find web interfaces on common ports
-        for port in self.common_ports:
-            has_web, url, content, headers = self.check_web_interface(ip_str, port)
-            if has_web:
-                device_info = self.identify_device(ip, url, content, headers)
-                return device_info
-        
-        # If no web interface found, check if host responds at all
-        if self.ping_host(ip_str):
-            return {
-                'ip': ip_str,
-                'url': 'No web interface',
-                'hostname': self.get_hostname(ip_str),
-                'device_type': '📱 Network Device',
-                'brand': 'Unknown',
-                'description': 'Device online but no web interface on common ports',
-                'status': 'Online'
-            }
+        # Simple approach - just try to connect to web ports
+        for port in [80, 8080, 443]:
+            try:
+                # Quick socket test
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(3)
+                result = sock.connect_ex((ip_str, port))
+                sock.close()
+                
+                if result == 0:  # Port is open
+                    # Try HTTP request
+                    try:
+                        protocol = 'https' if port == 443 else 'http'
+                        url = f"{protocol}://{ip_str}:{port}"
+                        response = requests.get(url, timeout=5, verify=False)
+                        
+                        device_info = self.identify_device(ip, url, response.text, response.headers)
+                        return device_info
+                        
+                    except:
+                        # Port open but HTTP failed, still count as device
+                        return {
+                            'ip': ip_str,
+                            'url': f"http://{ip_str}:{port}",
+                            'hostname': self.get_hostname(ip_str),
+                            'device_type': '📱 Network Device',
+                            'brand': 'Unknown',
+                            'description': f'Device found on port {port}',
+                            'status': 'Online'
+                        }
+            except:
+                continue
                 
         return None
     
@@ -223,13 +237,31 @@ class NetworkDeviceScanner:
             network = ipaddress.IPv4Network(network_range, strict=False)
             hosts = list(network.hosts())
             
-            if len(hosts) > 1000:
-                st.warning(f"Large network range ({len(hosts)} hosts). This may take a while!")
+            # Add some debug info
+            st.info(f"Scanning {len(hosts)} hosts in range {network_range}")
             
             total_hosts = len(hosts)
             scanned = 0
             
-            with ThreadPoolExecutor(max_workers=50) as executor:
+            # Test a few IPs manually first to debug
+            test_ips = [str(hosts[0]), str(hosts[-1])]  # First and last IP
+            if len(hosts) > 1:
+                test_ips.append(str(hosts[len(hosts)//2]))  # Middle IP
+                
+            st.write(f"Testing sample IPs: {test_ips}")
+            
+            for test_ip in test_ips:
+                try:
+                    # Quick socket test on port 80
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    result = sock.connect_ex((test_ip, 80))
+                    sock.close()
+                    st.write(f"IP {test_ip} port 80: {'OPEN' if result == 0 else 'CLOSED'}")
+                except Exception as e:
+                    st.write(f"IP {test_ip} error: {str(e)}")
+            
+            with ThreadPoolExecutor(max_workers=20) as executor:
                 future_to_ip = {executor.submit(self.scan_ip, ip): ip for ip in hosts}
                 
                 for future in as_completed(future_to_ip):
@@ -241,6 +273,7 @@ class NetworkDeviceScanner:
                         result = future.result()
                         if result:
                             self.found_devices.append(result)
+                            st.write(f"Found device: {result['ip']} - {result['device_type']}")
                     except Exception as e:
                         pass
                         
