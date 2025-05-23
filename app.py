@@ -1,143 +1,218 @@
 #!/usr/bin/env python3
 """
-Streamlit Network Camera Scanner
-Web app to scan local network for IP cameras and webcams
+Local Network Device Scanner
+Scans network by trying to access web interfaces on each IP
 """
 
 import streamlit as st
 import socket
-import threading
 import requests
 import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import pandas as pd
-from urllib.parse import urljoin
-import netifaces
+import subprocess
+import platform
+import re
+from urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-class CameraScanner:
+class NetworkDeviceScanner:
     def __init__(self):
-        self.found_cameras = []
-        self.common_camera_ports = [80, 81, 554, 8080, 8081, 8888, 9000]
-        self.camera_paths = [
-            '/videostream.cgi',
-            '/video.cgi',
-            '/mjpg/video.mjpg',
-            '/axis-cgi/mjpg/video.cgi',
-            '/cgi-bin/hi3510/snap.cgi',
-            '/snapshot.cgi',
-            '/image.jpg',
-            '/live/ch0',
-            '/cam/realmonitor',
-            '/web/tmpfs/snap.jpg',
-            '/cgi-bin/snapshot.cgi',
-            '/snapshot.jpg'
-        ]
+        self.found_devices = []
+        self.common_ports = [80, 8080, 443, 8443, 81, 8081, 8888, 9000]
         
-    def get_local_networks(self):
-        """Get all local network ranges"""
-        networks = []
+    def ping_host(self, ip):
+        """Check if host is alive using ping"""
         try:
-            for interface in netifaces.interfaces():
-                addrs = netifaces.ifaddresses(interface)
-                if netifaces.AF_INET in addrs:
-                    for addr in addrs[netifaces.AF_INET]:
-                        ip = addr['addr']
-                        netmask = addr.get('netmask', '255.255.255.0')
-                        if not ip.startswith('127.'):
-                            try:
-                                network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
-                                networks.append(str(network.network_address) + '/' + str(network.prefixlen))
-                            except:
-                                pass
-        except:
-            # Fallback to common private ranges
-            networks = ['192.168.1.0/24', '192.168.0.0/24', '10.0.0.0/24']
-        
-        return networks
-    
-    def port_scan(self, ip, port, timeout=1):
-        """Check if a port is open on given IP"""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            result = sock.connect_ex((ip, port))
-            sock.close()
-            return result == 0
+            param = "-n" if platform.system().lower() == "windows" else "-c"
+            timeout = "1000" if platform.system().lower() == "windows" else "1"
+            timeout_flag = "-W" if platform.system().lower() == "windows" else "-w"
+            
+            command = ["ping", param, "1", timeout_flag, timeout, str(ip)]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+            return result.returncode == 0
         except:
             return False
     
-    def check_http_service(self, ip, port):
-        """Check if HTTP service responds and looks like a camera"""
-        protocols = ['http', 'https'] if port == 443 else ['http']
-        
+    def get_hostname(self, ip):
+        """Try to get hostname"""
+        try:
+            hostname = socket.gethostbyaddr(str(ip))[0]
+            return hostname
+        except:
+            return "Unknown"
+    
+    def check_web_interface(self, ip, port):
+        """Check if there's a web interface on this IP:port"""
+        protocols = ['http']
+        if port in [443, 8443]:
+            protocols = ['https', 'http']
+        elif port in [80, 8080, 81, 8081, 8888, 9000]:
+            protocols = ['http', 'https']
+            
         for protocol in protocols:
             try:
-                base_url = f"{protocol}://{ip}:{port}"
-                response = requests.get(base_url, timeout=3, verify=False)
+                url = f"{protocol}://{ip}:{port}"
+                response = requests.get(url, timeout=5, verify=False, 
+                                      headers={'User-Agent': 'Mozilla/5.0'})
                 
-                # Check for camera-related keywords in response
-                content = response.text.lower()
-                headers = str(response.headers).lower()
-                
-                camera_indicators = [
-                    'camera', 'webcam', 'ipcam', 'axis', 'hikvision', 
-                    'dahua', 'foscam', 'vivotek', 'panasonic', 'sony',
-                    'mjpeg', 'rtsp', 'onvif', 'surveillance'
-                ]
-                
-                if any(indicator in content or indicator in headers for indicator in camera_indicators):
-                    return True, base_url, "Camera interface detected"
-                
-                # Check camera-specific paths
-                for path in self.camera_paths:
-                    try:
-                        cam_url = urljoin(base_url, path)
-                        cam_response = requests.get(cam_url, timeout=2, verify=False)
-                        if cam_response.status_code == 200:
-                            content_type = cam_response.headers.get('content-type', '').lower()
-                            if 'image' in content_type or 'video' in content_type:
-                                return True, cam_url, f"Camera stream found at {path}"
-                    except:
-                        continue
-                        
+                if response.status_code == 200:
+                    return True, url, response.text, response.headers
+                elif response.status_code in [401, 403]:  # Auth required
+                    return True, url, "Authentication Required", response.headers
+                    
+            except requests.exceptions.SSLError:
+                continue
+            except requests.exceptions.ConnectionError:
+                continue
             except:
                 continue
                 
-        return False, None, None
+        return False, None, None, None
+    
+    def identify_device(self, ip, url, content, headers):
+        """Identify what type of device this is based on web content"""
+        device_info = {
+            'ip': str(ip),
+            'url': url,
+            'hostname': self.get_hostname(ip),
+            'device_type': 'Unknown Device',
+            'brand': 'Unknown',
+            'description': '',
+            'status': 'Online'
+        }
+        
+        # Convert to lowercase for easier matching
+        content_lower = content.lower() if content else ""
+        headers_lower = str(headers).lower() if headers else ""
+        combined_text = content_lower + " " + headers_lower
+        
+        # Special IP address patterns
+        ip_str = str(ip)
+        if ip_str.endswith('.1'):
+            device_info['device_type'] = 'Router/Gateway'
+            device_info['description'] = 'Likely main router/gateway'
+        elif ip_str.endswith('.254'):
+            device_info['device_type'] = 'Router/Gateway'
+            device_info['description'] = 'Likely router/gateway'
+        
+        # Camera detection
+        camera_keywords = [
+            'camera', 'webcam', 'ipcam', 'surveillance', 'mjpeg', 'rtsp', 
+            'onvif', 'video', 'snapshot', 'livestream', 'security camera'
+        ]
+        camera_brands = {
+            'hikvision': 'Hikvision',
+            'dahua': 'Dahua', 
+            'axis': 'Axis',
+            'foscam': 'Foscam',
+            'vivotek': 'Vivotek',
+            'panasonic': 'Panasonic',
+            'sony': 'Sony',
+            'bosch': 'Bosch',
+            'pelco': 'Pelco',
+            'honeywell': 'Honeywell'
+        }
+        
+        if any(keyword in combined_text for keyword in camera_keywords):
+            device_info['device_type'] = '📷 IP Camera'
+            device_info['description'] = 'Security/surveillance camera'
+            
+            for brand_key, brand_name in camera_brands.items():
+                if brand_key in combined_text:
+                    device_info['brand'] = brand_name
+                    break
+        
+        # Router detection  
+        router_keywords = [
+            'router', 'gateway', 'modem', 'access point', 'wireless', 
+            'admin', 'configuration', 'settings', 'wifi', 'dhcp'
+        ]
+        router_brands = {
+            'netgear': 'Netgear',
+            'linksys': 'Linksys', 
+            'asus': 'ASUS',
+            'tp-link': 'TP-Link',
+            'tplink': 'TP-Link',
+            'd-link': 'D-Link',
+            'dlink': 'D-Link',
+            'belkin': 'Belkin',
+            'cisco': 'Cisco',
+            'ubiquiti': 'Ubiquiti'
+        }
+        
+        if any(keyword in combined_text for keyword in router_keywords):
+            device_info['device_type'] = '🌐 Router'
+            device_info['description'] = 'Network router/access point'
+            
+            for brand_key, brand_name in router_brands.items():
+                if brand_key in combined_text:
+                    device_info['brand'] = brand_name
+                    break
+        
+        # NAS/Storage detection
+        nas_keywords = ['nas', 'storage', 'synology', 'qnap', 'drobo', 'buffalo']
+        if any(keyword in combined_text for keyword in nas_keywords):
+            device_info['device_type'] = '💾 NAS/Storage'
+            device_info['description'] = 'Network storage device'
+        
+        # Printer detection
+        printer_keywords = ['printer', 'print', 'canon', 'hp', 'epson', 'brother']
+        if any(keyword in combined_text for keyword in printer_keywords):
+            device_info['device_type'] = '🖨️ Printer'
+            device_info['description'] = 'Network printer'
+        
+        # Smart home devices
+        smart_keywords = ['smart', 'iot', 'home', 'automation', 'alexa', 'google']
+        if any(keyword in combined_text for keyword in smart_keywords):
+            device_info['device_type'] = '🏠 Smart Device'
+            device_info['description'] = 'Smart home device'
+            
+        # Media devices
+        media_keywords = ['plex', 'kodi', 'media', 'streaming', 'chromecast', 'roku']
+        if any(keyword in combined_text for keyword in media_keywords):
+            device_info['device_type'] = '📺 Media Device'
+            device_info['description'] = 'Media streaming device'
+        
+        return device_info
     
     def scan_ip(self, ip):
-        """Scan a single IP for camera services"""
-        results = []
+        """Scan a single IP address"""
         ip_str = str(ip)
         
-        for port in self.common_camera_ports:
-            if self.port_scan(ip_str, port):
-                is_camera, url, description = self.check_http_service(ip_str, port)
-                if is_camera:
-                    results.append({
-                        'ip': ip_str,
-                        'port': port,
-                        'url': url,
-                        'description': description,
-                        'status': 'Camera Found'
-                    })
-                else:
-                    results.append({
-                        'ip': ip_str,
-                        'port': port,
-                        'url': f"http://{ip_str}:{port}",
-                        'description': 'Open port (unknown service)',
-                        'status': 'Open Port'
-                    })
-        
-        return results
+        # First check if host is alive
+        if not self.ping_host(ip_str):
+            return None
+            
+        # Try to find web interfaces
+        for port in self.common_ports:
+            has_web, url, content, headers = self.check_web_interface(ip_str, port)
+            if has_web:
+                device_info = self.identify_device(ip, url, content, headers)
+                return device_info
+                
+        # If no web interface but responds to ping
+        return {
+            'ip': ip_str,
+            'url': 'No web interface',
+            'hostname': self.get_hostname(ip_str),
+            'device_type': '📱 Network Device',
+            'brand': 'Unknown',
+            'description': 'Responds to ping but no web interface found',
+            'status': 'Online'
+        }
     
     def scan_network(self, network_range, progress_callback=None):
         """Scan entire network range"""
+        self.found_devices = []
+        
         try:
             network = ipaddress.IPv4Network(network_range, strict=False)
             hosts = list(network.hosts())
+            
+            if len(hosts) > 1000:
+                st.warning(f"Large network range ({len(hosts)} hosts). This may take a while!")
             
             total_hosts = len(hosts)
             scanned = 0
@@ -151,8 +226,9 @@ class CameraScanner:
                         progress_callback(scanned, total_hosts)
                     
                     try:
-                        results = future.result()
-                        self.found_cameras.extend(results)
+                        result = future.result()
+                        if result:
+                            self.found_devices.append(result)
                     except Exception as e:
                         pass
                         
@@ -160,115 +236,114 @@ class CameraScanner:
             st.error(f"Error scanning network {network_range}: {str(e)}")
 
 def main():
-    st.set_page_config(page_title="Network Camera Scanner", page_icon="📷", layout="wide")
+    st.set_page_config(page_title="Network Device Scanner", page_icon="🔍", layout="wide")
     
-    st.title("🎥 Network Camera Scanner")
-    st.markdown("Scan your local network for IP cameras and webcams")
+    st.title("🔍 Network Device Scanner")
+    st.markdown("Discover all devices on your local network by checking their web interfaces")
     
-    scanner = CameraScanner()
+    scanner = NetworkDeviceScanner()
     
-    # Sidebar for configuration
+    # Sidebar configuration
     st.sidebar.header("⚙️ Configuration")
     
-    # Manual network input
-    selected_network = st.sidebar.text_input(
+    network_range = st.sidebar.text_input(
         "Network Range (CIDR):",
-        value="192.168.0.0/16",
-        help="Enter network range in CIDR notation (e.g., 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12)"
+        value="192.168.0.0/24",
+        help="Enter network range to scan (e.g., 192.168.1.0/24, 10.0.0.0/8)"
     )
     
-    # Show some common examples
-    st.sidebar.markdown("**Common ranges:**")
-    st.sidebar.markdown("• `192.168.0.0/16` - All 192.168.x.x")
+    st.sidebar.markdown("**Examples:**")
     st.sidebar.markdown("• `192.168.1.0/24` - 192.168.1.1-254")
-    st.sidebar.markdown("• `10.0.0.0/8` - All 10.x.x.x")
-    st.sidebar.markdown("• `172.16.0.0/12` - 172.16-31.x.x")
+    st.sidebar.markdown("• `192.168.0.0/16` - All 192.168.x.x")
+    st.sidebar.markdown("• `10.0.0.0/24` - 10.0.0.1-254")
     
-    scan_button = st.sidebar.button("🔍 Start Scan", type="primary")
+    scan_button = st.sidebar.button("🚀 Start Scan", type="primary")
     
-    # Main content area
-    col1, col2 = st.columns([2, 1])
-    
-    with col2:
-        st.subheader("📊 Scan Statistics")
-        stats_placeholder = st.empty()
-        
-    with col1:
-        st.subheader("🎯 Scan Results")
-        results_placeholder = st.empty()
-    
+    # Main content
     if scan_button:
-        scanner.found_cameras = []  # Reset results
-        
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         def update_progress(current, total):
             progress = current / total
             progress_bar.progress(progress)
-            status_text.text(f"Scanning... {current}/{total} hosts checked")
+            status_text.text(f"Scanning... {current}/{total} hosts ({progress:.1%})")
         
         start_time = time.time()
         
-        with st.spinner(f"Scanning network {selected_network}..."):
-            scanner.scan_network(selected_network, update_progress)
+        with st.spinner(f"Scanning network {network_range}..."):
+            scanner.scan_network(network_range, update_progress)
         
         end_time = time.time()
         scan_duration = end_time - start_time
         
-        # Clear progress indicators
+        # Clear progress
         progress_bar.empty()
         status_text.empty()
         
         # Display results
-        if scanner.found_cameras:
-            # Create DataFrame for better display
-            df = pd.DataFrame(scanner.found_cameras)
+        if scanner.found_devices:
+            st.success(f"🎉 Found {len(scanner.found_devices)} devices in {scan_duration:.1f} seconds!")
             
-            # Separate cameras from other open ports
-            cameras = df[df['status'] == 'Camera Found']
-            open_ports = df[df['status'] == 'Open Port']
+            # Create DataFrame
+            df = pd.DataFrame(scanner.found_devices)
             
-            # Display statistics
-            with stats_placeholder.container():
-                st.metric("🎥 Cameras Found", len(cameras))
-                st.metric("🔓 Open Ports", len(open_ports))
+            # Statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("📱 Total Devices", len(scanner.found_devices))
+            with col2:
+                cameras = len([d for d in scanner.found_devices if '📷' in d['device_type']])
+                st.metric("📷 Cameras", cameras)
+            with col3:
+                routers = len([d for d in scanner.found_devices if '🌐' in d['device_type']])
+                st.metric("🌐 Routers", routers)
+            with col4:
                 st.metric("⏱️ Scan Time", f"{scan_duration:.1f}s")
             
-            # Display camera results
-            with results_placeholder.container():
-                if len(cameras) > 0:
-                    st.success(f"Found {len(cameras)} potential camera(s)!")
+            # Device list
+            st.subheader("🔍 Discovered Devices")
+            
+            for device in sorted(scanner.found_devices, key=lambda x: ipaddress.IPv4Address(x['ip'])):
+                with st.expander(f"{device['device_type']} - {device['ip']}", expanded=False):
+                    col1, col2 = st.columns([1, 1])
                     
-                    for _, camera in cameras.iterrows():
-                        with st.expander(f"📷 Camera at {camera['ip']}:{camera['port']}", expanded=True):
-                            st.write(f"**IP Address:** {camera['ip']}")
-                            st.write(f"**Port:** {camera['port']}")
-                            st.write(f"**Description:** {camera['description']}")
-                            st.write(f"**URL:** {camera['url']}")
-                            
-                            # Try to display image if it's an image endpoint
-                            if any(ext in camera['url'].lower() for ext in ['.jpg', '.jpeg', '.png', 'image']):
-                                try:
-                                    st.image(camera['url'], caption=f"Live feed from {camera['ip']}")
-                                except:
-                                    st.info("Could not display image (may require authentication)")
-                
-                if len(open_ports) > 0:
-                    with st.expander(f"🔓 Other Open Ports ({len(open_ports)})"):
-                        st.dataframe(open_ports[['ip', 'port', 'url']], use_container_width=True)
-        else:
-            with stats_placeholder.container():
-                st.metric("🎥 Cameras Found", 0)
-                st.metric("⏱️ Scan Time", f"{scan_duration:.1f}s")
+                    with col1:
+                        st.write(f"**IP Address:** {device['ip']}")
+                        st.write(f"**Hostname:** {device['hostname']}")
+                        st.write(f"**Device Type:** {device['device_type']}")
+                        st.write(f"**Brand:** {device['brand']}")
+                    
+                    with col2:
+                        st.write(f"**Status:** {device['status']}")
+                        st.write(f"**Description:** {device['description']}")
+                        if device['url'] != 'No web interface':
+                            st.write(f"**Access:** [Open Device]({device['url']})")
+                        
+                    # Special handling for cameras
+                    if '📷' in device['device_type'] and device['url'] != 'No web interface':
+                        st.info(f"🎥 **Camera Access:** You can try accessing this camera at {device['url']}")
             
-            with results_placeholder.container():
-                st.warning("No cameras found on the selected network range.")
-                st.info("This could mean:\n- No cameras are present\n- Cameras are on different ports\n- Cameras require authentication\n- Firewall is blocking access")
+            # Summary table
+            st.subheader("📊 Device Summary")
+            summary_df = df[['ip', 'hostname', 'device_type', 'brand', 'url']].copy()
+            st.dataframe(summary_df, use_container_width=True)
+            
+        else:
+            st.warning("❌ No devices found on the specified network range")
+            st.info("Try:\n• Check if the network range is correct\n• Ensure devices are powered on\n• Some devices may not respond to ping or have web interfaces")
     
-    # Footer
+    # Instructions
     st.markdown("---")
-    st.markdown("**Note:** This tool scans your local network for cameras. Ensure you have permission to scan the network you're testing.")
+    st.markdown("""
+    **How it works:**
+    1. Pings each IP to see if it's alive
+    2. Checks common web ports (80, 8080, 443, etc.)
+    3. Analyzes web content to identify device types
+    4. Shows you direct links to access each device
+    
+    **Found a camera?** Click the link to access it directly in your browser!
+    """)
 
 if __name__ == "__main__":
     main()
