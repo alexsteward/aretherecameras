@@ -50,6 +50,12 @@ def scan_network(self, network_range, progress_callback=None):
                         progress_callback(scanned, total_hosts)
                     
                     try:
+                        result = future.result()
+                        if result:
+                            self.found_devices.append(result)
+                            st.write(f"Found device: {result['ip']} - {result['device_type']}")
+                    except Exception as e:
+                        pass
                 #!/usr/bin/env python3
 """
 Local Network Device Scanner
